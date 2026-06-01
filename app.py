@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+from supabase import create_client, Client
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
@@ -21,17 +21,22 @@ QUIZ_DATA = [
     {"q": "7. 실제 연령과 이상적 연령 간의 차이를 상기한 소비자는 (______) 해석수준의 광고 메시지를 접했을 때 제품 구매의도가 더 높게 나타난다.", "a": "상위"}
 ]
 
-
 NUM_QUESTIONS = len(QUIZ_DATA)
 
 # 페이지 설정
 st.set_page_config(page_title=f"{SUBJECT_NAME}", layout="wide")
 
-# 구글 시트 연결
+# Supabase 연결 설정
+@st.cache_resource
+def init_connection() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
 try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except:
-    st.error("구글 시트 연결 설정(Secrets)이 필요합니다.")
+    supabase = init_connection()
+except Exception as e:
+    st.error("수파베이스 연결 설정(Secrets)이 필요합니다.")
 
 if "submitted_on_this_device" not in st.session_state:
     st.session_state.submitted_on_this_device = False
@@ -69,10 +74,10 @@ with tab1:
                     st.error("이름과 학번을 입력해 주세요.")
                 else:
                     try:
-                        master_df = conn.read(worksheet="전체데이터", ttl=0)
-                        already_exists = master_df[(master_df['주차'] == CURRENT_WEEK) & (master_df['학번'] == student_id)]
+                        # 수파베이스에서 이번 주차, 해당 학번의 데이터가 있는지 조회
+                        existing_data = supabase.table("sm001_quiz_results").select("*").eq("주차", CURRENT_WEEK).eq("학번", student_id).execute()
 
-                        if not already_exists.empty:
+                        if existing_data.data: # 이미 제출한 기록이 있다면
                             st.error(f"❌ {name} 학생은 이미 제출했습니다.")
                         else:
                             kst = timezone(timedelta(hours=9))
@@ -91,8 +96,9 @@ with tab1:
                                 row_dict[f"q{i}_결과"] = "O" if is_correct else "X"
                             
                             row_dict["총점"] = total_correct
-                            updated_master = pd.concat([master_df, pd.DataFrame([row_dict])], ignore_index=True)
-                            conn.update(worksheet="전체데이터", data=updated_master)
+                            
+                            # 수파베이스에 새 데이터 삽입
+                            supabase.table("sm001_quiz_results").insert(row_dict).execute()
                             
                             st.session_state.submitted_on_this_device = True
                             st.success(f"{name} 학생, 제출 성공! ({total_correct}/{NUM_QUESTIONS})")
@@ -105,9 +111,10 @@ with tab2:
     st.subheader(f"📍 {CURRENT_WEEK} 제출 완료 명단")
     if st.button("🔄 명단 확인/새로고침"):
         try:
-            # 트래픽 부하 감소를 위해 5분 캐시 적용
-            data = conn.read(worksheet="전체데이터", ttl=300)
-            today_list = data[data['주차'] == CURRENT_WEEK]
+            # 수파베이스에서 이번 주차 데이터만 가져옴
+            response = supabase.table("sm001_quiz_results").select("*").eq("주차", CURRENT_WEEK).execute()
+            today_list = pd.DataFrame(response.data)
+            
             if not today_list.empty:
                 st.write(f"현재 총 {len(today_list)}명 제출 완료")
                 cols = st.columns(6)
@@ -124,11 +131,16 @@ with tab3:
     admin_pw = st.text_input("비밀번호를 입력하세요", type="password")
     if admin_pw == ADMIN_PASSWORD:
         try:
-            data = conn.read(worksheet="전체데이터", ttl=0)
+            # 전체 데이터를 가져와서 분석
+            response = supabase.table("sm001_quiz_results").select("*").execute()
+            data = pd.DataFrame(response.data)
+            
             if not data.empty:
                 stats = data.groupby(['학번', '이름'])['총점'].mean().reset_index()
                 stats['정답률(%)'] = (stats['총점'] / NUM_QUESTIONS * 100).round(1)
                 st.dataframe(stats, use_container_width=True)
                 st.download_button("엑셀 다운로드", data=data.to_csv(index=False).encode('utf-8-sig'), file_name=f"{SUBJECT_NAME}_결과.csv", mime="text/csv")
+            else:
+                st.info("아직 제출된 데이터가 없습니다.")
         except:
             st.error("데이터 로드 실패")
